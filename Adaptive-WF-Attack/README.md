@@ -1,98 +1,146 @@
-# Proteus
+# Proteus Baseline Core
 
-This repository accompanies our **NDSS 2026** paper:
-**Enhancing Website Fingerprinting Attacks against Traffic Drift**.
+This repository is a lightweight baseline package for using Proteus-style
+unsupervised target adaptation with your own traffic-classification models.
 
-Proteus introduces an adaptive fine-tuning framework that significantly enhances the robustness of website fingerprinting (WF) attacks against **temporal, version, network, behavioral, and open-world traffic drift scenarios**, by leveraging **unlabeled traffic** for continual adaptation.
+It intentionally keeps only:
 
----
+- JSON/JSONL/directory traffic data conversion to `.npz`.
+- Core Proteus adaptation logic.
+- A generic runner that imports an external PyTorch model.
 
-## 📂 Datasets
+It no longer vendors the original WFlib attack models or the authors' dataset
+scripts. Your main repository should provide the attack model, source-trained
+checkpoint, and final evaluation code.
 
-We collected **over 350,000 real-world Tor traffic traces**, covering diverse drift scenarios.
+## Data Format
 
-* The dataset is organized into **six categories** corresponding to the experimental settings in our paper.
-* Download the datasets via [link](https://drive.google.com/drive/folders/1bAqAvvDrY2wrY4EU-Rxm9mv9hsIvKwGk).
+The converter writes the minimal split layout:
 
-```bash
-mkdir datasets
+```text
+datasets/<DatasetName>/
+  train.npz
+  valid.npz
+  test.npz
+  label_mapping.json
+  manifest.json
 ```
 
-Extract all datasets and place them under the `datasets/` directory.
+Each `.npz` contains:
 
----
-
-## ⚙️ Installation
-
-Clone this repository and install the dependencies:
-
-```bash
-cd wflib_copy
-pip install --user .
-cd ..
+```python
+X  # [num_samples, seq_len]
+y  # [num_samples]
 ```
 
-More details can be found in [WFlib](https://github.com/Xinhao-Deng/Website-Fingerprinting-Library).
+For a faithful DF + Proteus baseline, store signed packet-size sequences in
+`X` and run Proteus with `--feature DIR`. The loader applies `np.sign(X)` and
+turns signed packet sizes into direction sequences.
 
----
+## Convert JSON to NPZ
 
-## 🧪 Running Experiments
-
-We provide scripts to reproduce the main experiments reported in our NDSS 2026 paper.
-
-* **Temporal Drift**
-
-```bash
-bash scripts/TemporalDrift/Proteus.sh
+```powershell
+python custom_dataset\json_to_npz.py `
+  --source E:\data\source_json_or_dir `
+  --target E:\data\target_json_or_dir `
+  --out_dataset MyDrift `
+  --view dir `
+  --seq_len 5000 `
+  --valid_ratio 0.1 `
+  --seed 2024
 ```
 
-* **Version Drift**
+Supported JSON layouts:
 
-```bash
-bash scripts/VersionDrift/Proteus.sh
+- `.json` list of samples.
+- `.jsonl` one sample per line.
+- Directory layout such as `class_a/*.json`, `class_b/*.json`.
+- Dictionary layout such as `{"class_a": [...], "class_b": [...]}`.
+
+Common keys are auto-detected:
+
+- Packet-size sequence: `ps`, `packet_size`, `packet_length`, `flow`,
+  `sequence`, `X`.
+- IAT sequence: `iat`, `time`, `arrive_time_delta`, `inter_arrival_time`.
+- Label: `label`, `y`, `class`, `class_name`, `site`, `website`.
+
+Use explicit keys if needed:
+
+```powershell
+python custom_dataset\json_to_npz.py `
+  --source E:\data\source.json `
+  --target E:\data\target.json `
+  --out_dataset MyDrift `
+  --view dir `
+  --sequence_key signed_ps `
+  --label_key website_id `
+  --seq_len 5000
 ```
 
-* **Network Drift**
+## Run Proteus With an External Model
 
-```bash
-bash scripts/NetworkDrift/Proteus.sh
+Your model must be a PyTorch module whose forward method returns:
+
+```python
+logits, features = model(inputs)
 ```
 
-* **Behavioral Drift**
+Example:
 
-```bash
-bash scripts/BehaviorDrift/Proteus.sh
+```powershell
+python run_proteus.py `
+  --train datasets\MyDrift\train.npz `
+  --target datasets\MyDrift\test.npz `
+  --feature DIR `
+  --seq_len 5000 `
+  --model_module my_repo.models.df `
+  --model_class DF `
+  --checkpoint E:\my_repo\checkpoints\df_source.pth `
+  --output_checkpoint E:\my_repo\checkpoints\df_proteus.pth `
+  --history_json E:\my_repo\results\df_proteus_history.json `
+  --device cuda:0 `
+  --batch_size 128 `
+  --epochs 100 `
+  --lr 1e-3 `
+  --gmm_threshold 0.6
 ```
 
-* **Open-World Setting**
+If your checkpoint is a dictionary containing the state dict under a key:
 
-```bash
-bash scripts/OpenWorld/Proteus.sh
+```powershell
+--checkpoint_key state_dict
 ```
 
-* **Against Defenses**
+If the model constructor needs extra arguments:
 
-```bash
-bash scripts/Defense/Proteus.sh
+```powershell
+--model_kwargs "{`"dropout`": 0.1}"
 ```
 
----
+## Proteus Objective
 
-## 📖 Citation
+For each adaptation step, Proteus uses:
 
-If you use this code or dataset in your research, please cite our paper:
-
-```bibtex
-@inproceedings{proteus2026,
-  title     = {Enhancing Website Fingerprinting Attacks against Traffic Drift},
-  author    = {Xinhao Deng, Yixiang Zhang, Qi Li, Zhuotao Liu, Yabo Wang, Ke Xu},
-  booktitle = {Network and Distributed System Security (NDSS) Symposium},
-  year      = {2026}
-}
+```text
+source CE
++ pseudo-label target CE
++ target entropy/balance loss
++ source-target MMD
 ```
 
----
+Target labels are not used in the adaptation loss. If target labels exist in
+the `.npz`, they are used only for reporting target accuracy in the adaptation
+history.
 
-## 📜 License
+## Recommended Baseline Comparison
 
-This project is released under the **MIT License**. See [LICENSE](./LICENSE) for details.
+For your multi-modal method, keep the baseline single-view and faithful:
+
+| Method | Backbone | Input View | Adaptation |
+|---|---|---|---|
+| Source-only | DF | DIR | None |
+| Proteus baseline | DF | DIR | Proteus |
+| Your single-view | DF-style | DIR | Yours |
+| Your multi-view | DF-style encoders | DIR + PS + IAT | Yours |
+
+This keeps the baseline clean while making the multi-view contribution explicit.
